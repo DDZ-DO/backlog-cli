@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+backlog - Simple CLI for managing AI agent task backlogs.
+
+Usage:
+    backlog init              Create BACKLOG.md with template
+    backlog add "Task"        Add new item
+    backlog start <id>        Mark item as in-progress
+    backlog done <id>         Mark item as done
+    backlog drop <id>         Remove item from backlog
+    backlog status            Show current status
+    backlog stale [hours]     Show items in-progress too long (default: 2h)
+    backlog next              Show next todo item
+"""
+
+import sys
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+BACKLOG_FILE = "BACKLOG.md"
+
+TEMPLATE = """# BACKLOG
+
+> Automatisch verwaltet mit `backlog` CLI.
+> Lies diese Datei bei Session-Start. Update sie bei Session-Ende.
+
+## 🔄 In Progress
+
+## 📋 Todo
+
+## ✅ Done
+
+---
+*Letzte Aktualisierung: {timestamp}*
+"""
+
+def get_backlog_path():
+    """Find BACKLOG.md in current dir or git root."""
+    # First check current directory
+    if os.path.exists(BACKLOG_FILE):
+        return Path(BACKLOG_FILE)
+    
+    # Try git root
+    try:
+        import subprocess
+        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            git_root = Path(result.stdout.strip())
+            backlog_path = git_root / BACKLOG_FILE
+            if backlog_path.exists():
+                return backlog_path
+            # Return git root path for init
+            return backlog_path
+    except:
+        pass
+    
+    return Path(BACKLOG_FILE)
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_backlog(content):
+    """Parse BACKLOG.md into sections."""
+    sections = {
+        'in_progress': [],
+        'todo': [],
+        'done': [],
+        'header': '',
+        'footer': ''
+    }
+    
+    current_section = 'header'
+    lines = content.split('\n')
+    
+    for line in lines:
+        lower = line.lower().strip()
+        
+        if '## 🔄 in progress' in lower or '## in progress' in lower:
+            current_section = 'in_progress'
+            continue
+        elif '## 📋 todo' in lower or '## todo' in lower:
+            current_section = 'todo'
+            continue
+        elif '## ✅ done' in lower or '## done' in lower:
+            current_section = 'done'
+            continue
+        elif line.startswith('---'):
+            current_section = 'footer'
+            sections['footer'] += line + '\n'
+            continue
+        
+        if current_section == 'header':
+            sections['header'] += line + '\n'
+        elif current_section == 'footer':
+            sections['footer'] += line + '\n'
+        elif current_section in ['in_progress', 'todo', 'done']:
+            # Parse task lines
+            match = re.match(r'^- \[([ x])\] #(\d+) (.+)$', line.strip())
+            if match:
+                checked, task_id, rest = match.groups()
+                # Extract timestamp if present
+                ts_match = re.search(r'\((started|done): ([^)]+)\)', rest)
+                timestamp = ts_match.group(2) if ts_match else None
+                description = re.sub(r'\s*\((started|done): [^)]+\)', '', rest).strip()
+                
+                sections[current_section].append({
+                    'id': int(task_id),
+                    'description': description,
+                    'timestamp': timestamp,
+                    'checked': checked == 'x'
+                })
+            elif line.strip() and not line.strip().startswith('#'):
+                # Non-empty, non-header line - might be a malformed task
+                pass
+    
+    return sections
+
+def render_backlog(sections):
+    """Render sections back to markdown."""
+    lines = [sections['header'].rstrip()]
+    
+    lines.append("\n## 🔄 In Progress\n")
+    for task in sections['in_progress']:
+        ts = f" (started: {task['timestamp']})" if task.get('timestamp') else ""
+        lines.append(f"- [ ] #{task['id']} {task['description']}{ts}")
+    
+    lines.append("\n## 📋 Todo\n")
+    for task in sections['todo']:
+        lines.append(f"- [ ] #{task['id']} {task['description']}")
+    
+    lines.append("\n## ✅ Done\n")
+    for task in sections['done']:
+        ts = f" (done: {task['timestamp']})" if task.get('timestamp') else ""
+        lines.append(f"- [x] #{task['id']} {task['description']}{ts}")
+    
+    lines.append(f"\n---\n*Letzte Aktualisierung: {now_iso()}*")
+    
+    return '\n'.join(lines)
+
+def get_next_id(sections):
+    """Get next available task ID."""
+    all_ids = []
+    for section in ['in_progress', 'todo', 'done']:
+        all_ids.extend(t['id'] for t in sections[section])
+    return max(all_ids, default=0) + 1
+
+def cmd_init():
+    """Initialize BACKLOG.md."""
+    path = get_backlog_path()
+    if path.exists():
+        print(f"⚠️  {path} already exists")
+        return 1
+    
+    content = TEMPLATE.format(timestamp=now_iso())
+    path.write_text(content)
+    print(f"✅ Created {path}")
+    return 0
+
+def cmd_add(description):
+    """Add a new task."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found. Run 'backlog init' first.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    new_id = get_next_id(sections)
+    sections['todo'].append({
+        'id': new_id,
+        'description': description,
+        'timestamp': None,
+        'checked': False
+    })
+    
+    path.write_text(render_backlog(sections))
+    print(f"✅ Added #{new_id}: {description}")
+    return 0
+
+def cmd_start(task_id):
+    """Mark a task as in-progress."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    # Find task in todo
+    task = None
+    for i, t in enumerate(sections['todo']):
+        if t['id'] == task_id:
+            task = sections['todo'].pop(i)
+            break
+    
+    if not task:
+        # Check if already in progress
+        for t in sections['in_progress']:
+            if t['id'] == task_id:
+                print(f"⚠️  #{task_id} is already in progress")
+                return 1
+        print(f"❌ Task #{task_id} not found in todo")
+        return 1
+    
+    task['timestamp'] = now_iso()
+    sections['in_progress'].insert(0, task)
+    
+    path.write_text(render_backlog(sections))
+    print(f"🔄 Started #{task_id}: {task['description']}")
+    return 0
+
+def cmd_done(task_id):
+    """Mark a task as done."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    # Find task in in_progress or todo
+    task = None
+    for section in ['in_progress', 'todo']:
+        for i, t in enumerate(sections[section]):
+            if t['id'] == task_id:
+                task = sections[section].pop(i)
+                break
+        if task:
+            break
+    
+    if not task:
+        print(f"❌ Task #{task_id} not found")
+        return 1
+    
+    task['timestamp'] = now_iso()
+    task['checked'] = True
+    sections['done'].insert(0, task)
+    
+    path.write_text(render_backlog(sections))
+    print(f"✅ Completed #{task_id}: {task['description']}")
+    return 0
+
+def cmd_drop(task_id):
+    """Remove a task from backlog."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    # Find and remove task from any section
+    task = None
+    for section in ['in_progress', 'todo', 'done']:
+        for i, t in enumerate(sections[section]):
+            if t['id'] == task_id:
+                task = sections[section].pop(i)
+                break
+        if task:
+            break
+    
+    if not task:
+        print(f"❌ Task #{task_id} not found")
+        return 1
+    
+    path.write_text(render_backlog(sections))
+    print(f"🗑️  Dropped #{task_id}: {task['description']}")
+    return 0
+
+def cmd_status():
+    """Show backlog status."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found. Run 'backlog init' first.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    print(f"📊 BACKLOG Status ({path})\n")
+    
+    print("🔄 In Progress:")
+    if sections['in_progress']:
+        for t in sections['in_progress']:
+            ts = f" (since {t['timestamp']})" if t.get('timestamp') else ""
+            print(f"   #{t['id']} {t['description']}{ts}")
+    else:
+        print("   (none)")
+    
+    print("\n📋 Todo:")
+    if sections['todo']:
+        for t in sections['todo']:
+            print(f"   #{t['id']} {t['description']}")
+    else:
+        print("   (none)")
+    
+    print(f"\n✅ Done: {len(sections['done'])} items")
+    
+    # Summary
+    total = len(sections['in_progress']) + len(sections['todo'])
+    print(f"\n📈 {total} items remaining")
+    
+    return 0
+
+def cmd_stale(hours=2):
+    """Show items in-progress for too long."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    now = datetime.now(timezone.utc)
+    stale_items = []
+    
+    for task in sections['in_progress']:
+        if task.get('timestamp'):
+            try:
+                started = datetime.fromisoformat(task['timestamp'].replace('Z', '+00:00'))
+                age_hours = (now - started).total_seconds() / 3600
+                if age_hours >= hours:
+                    stale_items.append((task, age_hours))
+            except:
+                pass
+    
+    if stale_items:
+        print(f"⚠️  Stale items (>{hours}h in progress):\n")
+        for task, age in stale_items:
+            print(f"   #{task['id']} {task['description']} ({age:.1f}h)")
+        return 1
+    else:
+        print(f"✅ No stale items (threshold: {hours}h)")
+        return 0
+
+def cmd_next():
+    """Show next todo item."""
+    path = get_backlog_path()
+    if not path.exists():
+        print(f"❌ {BACKLOG_FILE} not found.")
+        return 1
+    
+    content = path.read_text()
+    sections = parse_backlog(content)
+    
+    if sections['in_progress']:
+        t = sections['in_progress'][0]
+        print(f"🔄 Currently working on: #{t['id']} {t['description']}")
+    elif sections['todo']:
+        t = sections['todo'][0]
+        print(f"📋 Next up: #{t['id']} {t['description']}")
+        print(f"   Run: backlog start {t['id']}")
+    else:
+        print("🎉 All done!")
+    
+    return 0
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 0
+    
+    cmd = sys.argv[1]
+    
+    if cmd == 'init':
+        return cmd_init()
+    elif cmd == 'add' and len(sys.argv) >= 3:
+        return cmd_add(' '.join(sys.argv[2:]))
+    elif cmd == 'start' and len(sys.argv) >= 3:
+        return cmd_start(int(sys.argv[2]))
+    elif cmd == 'done' and len(sys.argv) >= 3:
+        return cmd_done(int(sys.argv[2]))
+    elif cmd == 'drop' and len(sys.argv) >= 3:
+        return cmd_drop(int(sys.argv[2]))
+    elif cmd == 'status':
+        return cmd_status()
+    elif cmd == 'stale':
+        hours = float(sys.argv[2]) if len(sys.argv) >= 3 else 2
+        return cmd_stale(hours)
+    elif cmd == 'next':
+        return cmd_next()
+    else:
+        print(__doc__)
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

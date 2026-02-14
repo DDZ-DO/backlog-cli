@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# Git post-commit hook - reminds to update BACKLOG.md
+#
+
+BACKLOG_FILE="BACKLOG.md"
+
+# Check if BACKLOG.md exists and wasn't part of the commit
+if [ -f "$BACKLOG_FILE" ]; then
+    if ! git diff HEAD~1 --name-only 2>/dev/null | grep -q "^$BACKLOG_FILE$"; then
+        # BACKLOG exists but wasn't updated
+        if command -v backlog &> /dev/null; then
+            IN_PROGRESS=$(grep -c "## 🔄 In Progress" -A 100 "$BACKLOG_FILE" 2>/dev/null | head -1)
+            if grep -q "^- \[ \] #" "$BACKLOG_FILE"; then
+                echo ""
+                echo "💡 Reminder: Did you complete a BACKLOG item?"
+                echo "   Run: backlog status"
+                echo ""
+            fi
+        fi
+    fi
+fi
+
+exit 0
